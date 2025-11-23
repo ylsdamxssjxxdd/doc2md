@@ -1439,7 +1439,7 @@ static void collectPptTextRecords(const std::string &data,
                                   int length,
                                   std::vector<PptTextBucket> &slides,
                                   PptTextBucket &loose,
-                                  PptTextBucket *currentSlide = nullptr)
+                                  int currentSlideIndex = -1)
 {
     const int end = offset + length;
     int pos = offset;
@@ -1459,13 +1459,14 @@ static void collectPptTextRecords(const std::string &data,
                                             type == 0x0FF1);
         if (treatAsSlideContainer)
         {
-            slides.emplace_back();
-            collectPptTextRecords(data, bodyStart, static_cast<int>(size), slides, loose, &slides.back());
-            if (slides.back().lines.empty()) slides.pop_back();
+                slides.emplace_back();
+                const int newIndex = static_cast<int>(slides.size()) - 1;
+                collectPptTextRecords(data, bodyStart, static_cast<int>(size), slides, loose, newIndex);
+                if (slides.back().lines.empty()) slides.pop_back();
         }
         else if (recVer == 0x000F && size > 0)
         {
-            collectPptTextRecords(data, bodyStart, static_cast<int>(size), slides, loose, currentSlide);
+            collectPptTextRecords(data, bodyStart, static_cast<int>(size), slides, loose, currentSlideIndex);
         }
         else if (size > 0)
         {
@@ -1480,7 +1481,7 @@ static void collectPptTextRecords(const std::string &data,
                     if (trimmedLine.empty()) continue;
                     if (trimmedLine.find("\xEF\xBF\xBD") != std::string::npos) continue;
                     if (!looksLikeDocumentText(trimmedLine)) continue;
-                    PptTextBucket *target = currentSlide ? currentSlide : &loose;
+                    PptTextBucket *target = (currentSlideIndex >= 0) ? &slides[static_cast<size_t>(currentSlideIndex)] : &loose;
                     if (target->seen.insert(trimmedLine).second) target->lines.push_back(trimmedLine);
                 }
             }
@@ -1515,7 +1516,7 @@ static std::string readDpsViaPptBinary(const std::string &path)
 
     std::vector<PptTextBucket> slides;
     PptTextBucket loose;
-    collectPptTextRecords(stream, 0, static_cast<int>(stream.size()), slides, loose, nullptr);
+    collectPptTextRecords(stream, 0, static_cast<int>(stream.size()), slides, loose, -1);
     const std::string structured = formatDpsSlides(slides);
     if (!structured.empty()) return structured;
     if (loose.lines.empty()) return {};
