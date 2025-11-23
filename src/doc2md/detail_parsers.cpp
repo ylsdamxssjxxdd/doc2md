@@ -926,9 +926,13 @@ static std::string normalizeWordText(const std::string &raw)
             continue;
         }
         if (byte == 0x0D || byte == 0x0B || byte == 0x0C || byte == 0x1E || byte == 0x1F)
+        {
             cleaned.push_back('\n');
-        else
-            cleaned.push_back(static_cast<char>(byte));
+            continue;
+        }
+        if (byte < 0x20 && byte != 0x09)
+            continue;
+        cleaned.push_back(static_cast<char>(byte));
     }
     std::vector<std::string> lines = splitLines(cleaned);
     std::vector<std::string> filtered;
