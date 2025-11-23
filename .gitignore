@@ -12,3 +12,5 @@ build-linux
 modelcontextprotocol-sdk-1.21.1.tgz
 streamable-http.html
 Testing
+build-docker
+build-linux-g11
