@@ -12,6 +12,7 @@ set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -static -static-libg
 add_compile_definitions(_STATIC_CPPLIB)
 
 option(DOC2MD_BUILD_TESTS "Build doc2md unit tests" OFF)
+include(CTest)
 
 add_library(miniz STATIC
     thirdparty/miniz/miniz.c
@@ -27,3 +28,6 @@ target_include_directories(tinyxml2 PUBLIC ${CMAKE_SOURCE_DIR}/thirdparty/tinyxm
 
 add_subdirectory(src)
 add_subdirectory(examples)
+if(DOC2MD_BUILD_TESTS)
+    add_subdirectory(tests)
+endif()
