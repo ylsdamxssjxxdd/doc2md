@@ -19,3 +19,4 @@ add_library(tinyxml2 STATIC thirdparty/tinyxml2/tinyxml2.cpp)
 target_include_directories(tinyxml2 PUBLIC ${CMAKE_SOURCE_DIR}/thirdparty/tinyxml2)
 
 add_subdirectory(src)
+add_subdirectory(examples)
