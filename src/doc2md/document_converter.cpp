@@ -7,6 +7,7 @@
 #include <codecvt>
 #include <cstdint>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <regex>
@@ -16,6 +17,13 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 extern "C"
 {
@@ -150,10 +158,71 @@ static std::string readTextFile(const std::string &path)
     return oss.str();
 }
 
+static void appendUtf8CodePoint(std::string &out, uint32_t codePoint)
+{
+    if (codePoint <= 0x7F)
+    {
+        out.push_back(static_cast<char>(codePoint));
+    }
+    else if (codePoint <= 0x7FF)
+    {
+        out.push_back(static_cast<char>(0xC0 | (codePoint >> 6)));
+        out.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    }
+    else if (codePoint <= 0xFFFF)
+    {
+        out.push_back(static_cast<char>(0xE0 | (codePoint >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    }
+    else
+    {
+        out.push_back(static_cast<char>(0xF0 | (codePoint >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((codePoint >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+    }
+}
+
 static std::string utf16ToUtf8(const char16_t *data, size_t length)
 {
     static std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t> converter;
-    return converter.to_bytes(data, data + length);
+    try
+    {
+        return converter.to_bytes(data, data + length);
+    }
+    catch (const std::range_error &)
+    {
+        std::string out;
+        out.reserve(length * 3);
+        for (size_t i = 0; i < length; ++i)
+        {
+            const uint16_t lead = data[i];
+            if (lead >= 0xD800 && lead <= 0xDBFF)
+            {
+                if (i + 1 < length)
+                {
+                    const uint16_t trail = data[i + 1];
+                    if (trail >= 0xDC00 && trail <= 0xDFFF)
+                    {
+                        const uint32_t codePoint = 0x10000 + (((lead - 0xD800) << 10) | (trail - 0xDC00));
+                        appendUtf8CodePoint(out, codePoint);
+                        ++i;
+                        continue;
+                    }
+                }
+                // malformed lead surrogate; skip
+                continue;
+            }
+            if (lead >= 0xDC00 && lead <= 0xDFFF)
+            {
+                // stray trail surrogate; skip
+                continue;
+            }
+            appendUtf8CodePoint(out, lead);
+        }
+        return out;
+    }
 }
 
 static std::string utf16ToUtf8(const std::u16string &str)
@@ -737,6 +806,39 @@ static int chunkScore(const std::string &chunk)
     return score;
 }
 
+static std::string combineCandidateChunks(const std::vector<std::string> &chunks)
+{
+    if (chunks.empty()) return {};
+    std::unordered_set<std::string> seen;
+    std::vector<std::string> filtered;
+    filtered.reserve(chunks.size());
+    for (const std::string &chunk : chunks)
+    {
+        const std::string trimmedChunk = trim(chunk);
+        if (trimmedChunk.empty() || !looksLikeDocumentText(trimmedChunk)) continue;
+        if (seen.insert(trimmedChunk).second) filtered.push_back(trimmedChunk);
+    }
+    if (filtered.size() > 1)
+    {
+        std::vector<int> scores(filtered.size());
+        int bestScore = std::numeric_limits<int>::min();
+        for (size_t i = 0; i < filtered.size(); ++i)
+        {
+            scores[i] = chunkScore(filtered[i]);
+            bestScore = std::max(bestScore, scores[i]);
+        }
+        const int cutoff = bestScore > 0 ? bestScore - 4 : bestScore;
+        std::vector<std::string> prioritized;
+        prioritized.reserve(filtered.size());
+        for (size_t i = 0; i < filtered.size(); ++i)
+        {
+            if (scores[i] >= cutoff && scores[i] > 0) prioritized.push_back(filtered[i]);
+        }
+        if (!prioritized.empty()) filtered.swap(prioritized);
+    }
+    return join(filtered, "\n");
+}
+
 static std::string extractUtf16Text(const std::string &data)
 {
     if (data.empty()) return {};
@@ -764,35 +866,109 @@ static std::string extractUtf16Text(const std::string &data)
     }
     if (reading && current.size() >= 3) chunks.push_back(utf16ToUtf8(current));
 
-    std::unordered_set<std::string> seen;
-    std::vector<std::string> filtered;
-    for (const std::string &chunk : chunks)
-    {
-        const std::string trimmedChunk = trim(chunk);
-        if (trimmedChunk.empty() || !looksLikeDocumentText(trimmedChunk)) continue;
-        if (seen.insert(trimmedChunk).second) filtered.push_back(trimmedChunk);
-    }
+    return combineCandidateChunks(chunks);
+}
 
-    if (filtered.size() > 1)
+static uint16_t detectBiffCodePage(const std::string &stream)
+{
+    size_t offset = 0;
+    while (offset + 4 <= stream.size())
     {
-        std::vector<int> scores;
-        scores.reserve(filtered.size());
-        int bestScore = std::numeric_limits<int>::min();
-        for (const std::string &chunk : filtered)
-        {
-            const int score = chunkScore(chunk);
-            scores.push_back(score);
-            bestScore = std::max(bestScore, score);
-        }
-        const int cutoff = bestScore > 0 ? bestScore - 4 : bestScore;
-        std::vector<std::string> prioritized;
-        for (size_t i = 0; i < filtered.size(); ++i)
-        {
-            if (scores[i] >= cutoff && scores[i] > 0) prioritized.push_back(filtered[i]);
-        }
-        if (!prioritized.empty()) filtered = prioritized;
+        const uint8_t *ptr = reinterpret_cast<const uint8_t *>(stream.data() + offset);
+        const uint16_t id = readLe<uint16_t>(ptr);
+        const uint16_t size = readLe<uint16_t>(ptr + 2);
+        offset += 4;
+        if (offset + size > stream.size()) break;
+        if (id == 0x0042 && size >= 2)
+            return readLe<uint16_t>(reinterpret_cast<const uint8_t *>(stream.data() + offset));
+        offset += size;
     }
-    return join(filtered, "\n");
+    return 0;
+}
+
+static std::string convertBufferWithCodePage(const std::string &buffer, uint32_t codePage)
+{
+    if (buffer.empty()) return {};
+    if (codePage == 65001) return buffer;
+#ifdef _WIN32
+    const UINT cp = static_cast<UINT>(codePage);
+    const int wideLen = MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, buffer.data(), static_cast<int>(buffer.size()), nullptr, 0);
+    if (wideLen <= 0) return {};
+    std::wstring wide(wideLen, L'\0');
+    if (MultiByteToWideChar(cp, MB_ERR_INVALID_CHARS, buffer.data(), static_cast<int>(buffer.size()), &wide[0], wideLen) <= 0)
+        return {};
+    std::u16string u16;
+    u16.reserve(wide.size());
+    for (wchar_t ch : wide) u16.push_back(static_cast<char16_t>(ch));
+    return utf16ToUtf8(u16);
+#else
+    (void)buffer;
+    (void)codePage;
+    return {};
+#endif
+}
+
+static std::string decodeWithCodePage(const std::string &data, uint16_t codePage)
+{
+    if (data.empty()) return {};
+    if (codePage == 1200) return extractUtf16Text(data);
+
+    std::vector<std::string> decodedChunks;
+    std::string current;
+    const auto flushChunk = [&]() {
+        if (current.size() < 4)
+        {
+            current.clear();
+            return;
+        }
+        const std::string decoded = convertBufferWithCodePage(current, codePage);
+        if (!decoded.empty()) decodedChunks.push_back(decoded);
+        current.clear();
+    };
+
+    for (unsigned char byte : data)
+    {
+        if (byte == '\r' || byte == '\n')
+        {
+            current.push_back('\n');
+        }
+        else if (byte == '\t')
+        {
+            current.push_back('\t');
+        }
+        else if (byte >= 0x20 || byte >= 0xA1)
+        {
+            current.push_back(static_cast<char>(byte));
+        }
+        else
+        {
+            flushChunk();
+        }
+    }
+    flushChunk();
+    return combineCandidateChunks(decodedChunks);
+}
+
+static uint16_t codePageForName(const std::string &name)
+{
+    const std::string lower = toLower(name);
+    if (lower == "gb18030" || lower == "gbk" || lower == "gb2312") return 936;
+    if (lower == "big5") return 950;
+    if (lower == "shift-jis" || lower == "shift_jis" || lower == "sjis") return 932;
+    if (lower == "windows-1252" || lower == "cp1252") return 1252;
+    return 0;
+}
+
+static std::string decodeWithCodecNames(const std::string &data, std::initializer_list<const char *> names)
+{
+    for (const char *name : names)
+    {
+        const uint16_t codePage = codePageForName(name);
+        if (codePage == 0) continue;
+        const std::string decoded = decodeWithCodePage(data, codePage);
+        if (!decoded.empty()) return decoded;
+    }
+    return {};
 }
 
 static std::string readWpsViaWordBinary(const std::string &path)
@@ -826,20 +1002,6 @@ static std::string readWpsText(const std::string &path)
     return readWpsHeuristic(path);
 }
 
-static std::string readCompoundUtf16Stream(const std::string &path, const std::vector<std::string> &streamNames)
-{
-    CompoundFileReader reader;
-    if (!reader.load(path)) return {};
-    for (const std::string &name : streamNames)
-    {
-        const std::string data = reader.streamByName(name);
-        if (data.empty()) continue;
-        const std::string text = extractUtf16Text(data);
-        if (!text.empty()) return text;
-    }
-    return {};
-}
-
 static std::string formatMarkdownList(const std::string &text)
 {
     const std::vector<std::string> lines = splitLines(text);
@@ -855,7 +1017,19 @@ static std::string formatMarkdownList(const std::string &text)
 
 static std::string readEtText(const std::string &path)
 {
-    std::string text = readCompoundUtf16Stream(path, {"Workbook"});
+    std::string text;
+    CompoundFileReader reader;
+    if (reader.load(path))
+    {
+        const std::string workbook = reader.streamByName("Workbook");
+        if (!workbook.empty())
+        {
+            const uint16_t codePage = detectBiffCodePage(workbook);
+            if (codePage != 0 && codePage != 1200)
+                text = decodeWithCodePage(workbook, codePage);
+            if (text.empty()) text = extractUtf16Text(workbook);
+        }
+    }
     if (text.empty()) text = readWpsHeuristic(path);
     if (text.empty()) return {};
     return "## ET Workbook\n\n" + text;
@@ -863,7 +1037,18 @@ static std::string readEtText(const std::string &path)
 
 static std::string readDpsText(const std::string &path)
 {
-    std::string text = readCompoundUtf16Stream(path, {"PowerPoint Document"});
+    std::string text;
+    CompoundFileReader reader;
+    if (reader.load(path))
+    {
+        const std::string stream = reader.streamByName("PowerPoint Document");
+        if (!stream.empty())
+        {
+            text = extractUtf16Text(stream);
+            if (text.empty())
+                text = decodeWithCodecNames(stream, {"GB18030", "Big5", "Shift-JIS", "Windows-1252"});
+        }
+    }
     if (text.empty()) text = readWpsHeuristic(path);
     if (text.empty()) return {};
     const std::string list = formatMarkdownList(text);
@@ -1127,27 +1312,29 @@ static std::string readXlsxText(const std::string &path)
     return join(sheets, "\n\n");
 }
 
+static void collectParagraphText(const tinyxml2::XMLElement *node, std::string &out)
+{
+    if (!node) return;
+    const char *name = node->Name();
+    if (std::strcmp(name, "a:t") == 0)
+    {
+        if (const char *value = node->GetText()) out += value;
+    }
+    else if (std::strcmp(name, "a:br") == 0)
+    {
+        out.push_back('\n');
+    }
+    for (auto child = node->FirstChildElement(); child; child = child->NextSiblingElement())
+        collectParagraphText(child, out);
+}
+
 static void collectSlideParagraphs(const tinyxml2::XMLElement *node, std::vector<std::string> &paragraphs)
 {
     if (!node) return;
     if (std::strcmp(node->Name(), "a:p") == 0)
     {
         std::string text;
-        for (auto child = node->FirstChildElement(); child; child = child->NextSiblingElement())
-        {
-            if (std::strcmp(child->Name(), "a:t") == 0)
-            {
-                if (const char *value = child->GetText()) text += value;
-            }
-            else if (std::strcmp(child->Name(), "a:br") == 0)
-            {
-                text.push_back('\n');
-            }
-            else
-            {
-                collectSlideParagraphs(child, paragraphs);
-            }
-        }
+        collectParagraphText(node, text);
         const std::string trimmedText = trim(text);
         if (!trimmedText.empty()) paragraphs.push_back("- " + trimmedText);
         return;
