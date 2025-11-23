@@ -17,7 +17,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build build-essential
+          sudo apt-get install -y ninja-build build-essential gdb
 
       - name: Configure
         run: |
@@ -27,6 +27,12 @@ jobs:
 
       - name: Build doc2md_tests
         run: cmake --build build --target doc2md_tests
+
+      - name: Run doc2md_tests under gdb (capture backtrace on crash)
+        run: |
+          echo "Running tests under gdb to capture backtrace if a crash occurs"
+          set -o pipefail
+          gdb --batch --quiet -ex "set pagination off" -ex "run" -ex "bt full" --args build/tests/doc2md_tests || true
 
       - name: Run unit tests
         run: ctest --test-dir build --output-on-failure
