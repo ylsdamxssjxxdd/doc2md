@@ -20,6 +20,8 @@ add_library(miniz STATIC
     thirdparty/miniz/miniz_tdef.c)
 target_include_directories(miniz PUBLIC ${CMAKE_SOURCE_DIR}/thirdparty/miniz)
 
+add_subdirectory(thirdparty/libxls)
+
 add_library(tinyxml2 STATIC thirdparty/tinyxml2/tinyxml2.cpp)
 target_include_directories(tinyxml2 PUBLIC ${CMAKE_SOURCE_DIR}/thirdparty/tinyxml2)
 

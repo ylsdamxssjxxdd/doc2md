@@ -5,11 +5,13 @@
 #include <cctype>
 #include <cerrno>
 #include <codecvt>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -17,6 +19,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <iomanip>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -31,6 +34,7 @@ extern "C"
 }
 
 #include "tinyxml2.h"
+#include "xls.h"
 
 namespace doc2md
 {
@@ -1015,8 +1019,108 @@ static std::string formatMarkdownList(const std::string &text)
     return join(formatted, "\n");
 }
 
+struct XlsWorkbookCloser
+{
+    void operator()(xls::xlsWorkBook *wb) const
+    {
+        if (wb) xls::xls_close_WB(wb);
+    }
+};
+
+struct XlsWorksheetCloser
+{
+    void operator()(xls::xlsWorkSheet *ws) const
+    {
+        if (ws) xls::xls_close_WS(ws);
+    }
+};
+
+static std::string xlsCellToString(const xls::xlsCell *cell)
+{
+    if (!cell) return {};
+    if (cell->str) return std::string(cell->str);
+
+    switch (cell->id)
+    {
+    case XLS_RECORD_BOOLERR:
+        return cell->d != 0.0 ? "TRUE" : "FALSE";
+    case XLS_RECORD_NUMBER:
+    case XLS_RECORD_RK:
+    case XLS_RECORD_FORMULA:
+    case XLS_RECORD_FORMULA_ALT:
+        if (std::isfinite(cell->d))
+        {
+            std::ostringstream oss;
+            oss << std::setprecision(15) << cell->d;
+            return oss.str();
+        }
+        break;
+    default:
+        break;
+    }
+    if (cell->l != 0) return std::to_string(cell->l);
+    return {};
+}
+
+static std::string readEtViaLibxls(const std::string &path)
+{
+    xls::xls_error_t err = xls::LIBXLS_OK;
+    std::unique_ptr<xls::xlsWorkBook, XlsWorkbookCloser> wb(xls::xls_open_file(path.c_str(), "UTF-8", &err));
+    if (!wb) return {};
+
+    std::vector<std::string> sections;
+    int sheetIndex = 1;
+    for (xls::DWORD i = 0; i < wb->sheets.count; ++i)
+    {
+        std::unique_ptr<xls::xlsWorkSheet, XlsWorksheetCloser> ws(xls::xls_getWorkSheet(wb.get(), static_cast<int>(i)));
+        if (!ws) continue;
+        if (xls::xls_parseWorkSheet(ws.get()) != xls::LIBXLS_OK) continue;
+
+        const int lastRow = ws->rows.lastrow;
+        const int lastCol = ws->rows.lastcol;
+        if (lastRow < 0 || lastCol < 0) continue;
+
+        std::vector<std::vector<std::string>> rows;
+        rows.reserve(static_cast<size_t>(lastRow) + 1);
+        size_t maxColumns = 0;
+        for (int rowIndex = 0; rowIndex <= lastRow; ++rowIndex)
+        {
+            xls::xlsRow *row = xls::xls_row(ws.get(), static_cast<xls::WORD>(rowIndex));
+            if (!row) continue;
+
+            std::vector<std::string> rowCells;
+            rowCells.reserve(static_cast<size_t>(lastCol) + 1);
+            bool hasContent = false;
+            for (int colIndex = 0; colIndex <= lastCol; ++colIndex)
+            {
+                xls::xlsCell *cell = xls::xls_cell(ws.get(), static_cast<xls::WORD>(rowIndex), static_cast<xls::WORD>(colIndex));
+                std::string value = xlsCellToString(cell);
+                if (!trim(value).empty()) hasContent = true;
+                rowCells.push_back(std::move(value));
+            }
+            while (!rowCells.empty() && trim(rowCells.back()).empty()) rowCells.pop_back();
+            if (!hasContent || rowCells.empty()) continue;
+            maxColumns = std::max(maxColumns, rowCells.size());
+            rows.push_back(std::move(rowCells));
+        }
+
+        if (rows.empty() || maxColumns == 0) continue;
+        for (auto &row : rows)
+        {
+            if (row.size() < maxColumns) row.resize(maxColumns);
+        }
+        const std::string table = makeMarkdownTable(rows);
+        if (table.empty()) continue;
+        sections.push_back("## Sheet " + std::to_string(sheetIndex++) + "\n\n" + table);
+    }
+    return join(sections, "\n\n");
+}
+
 static std::string readEtText(const std::string &path)
 {
+    const std::string viaLibxls = readEtViaLibxls(path);
+    if (!viaLibxls.empty()) return viaLibxls;
+
     std::string text;
     CompoundFileReader reader;
     if (reader.load(path))
