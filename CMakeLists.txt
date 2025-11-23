@@ -6,6 +6,13 @@ set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(MINGW)
+    message(STATUS "Configuring static MinGW build")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libgcc -static-libstdc++")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -static -static-libgcc -static-libstdc++")
+    add_compile_definitions(_STATIC_CPPLIB)
+endif()
+
 option(DOC2MD_BUILD_TESTS "Build doc2md unit tests" OFF)
 
 add_library(miniz STATIC
