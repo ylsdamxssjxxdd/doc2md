@@ -39,7 +39,7 @@
 #include <wchar.h>
 #include <stdio.h>
 
-#ifdef HAVE_ICONV
+#if HAVE_ICONV
 #include <iconv.h>
 #endif
 
@@ -144,7 +144,7 @@ void verbose(char* str)
         printf("libxls : %s\n",str);
 }
 
-#ifdef HAVE_ICONV
+#if HAVE_ICONV
 
 struct codepage_entry_t {
     int code;
@@ -320,7 +320,7 @@ char* codepage_decode(const char *s, size_t len, xlsWorkBook *pWB) {
     if (!pWB->is5ver && strcmp(pWB->charset, "UTF-8") == 0)
         return transcode_latin1_to_utf8(s, len);
 
-#ifdef HAVE_ICONV
+#if HAVE_ICONV
     if (!pWB->converter) {
         const char *from_encoding = pWB->is5ver ? encoding_for_codepage(pWB->codepage) : "ISO-8859-1";
         iconv_t converter = iconv_open(pWB->charset, from_encoding);
@@ -350,7 +350,7 @@ char* transcode_utf16_to_utf8(const char *s, size_t len) {
 // Convert unicode string to the encoding desired by the workbook
 char* unicode_decode(const char *s, size_t len, xlsWorkBook *pWB)
 {
-#ifdef HAVE_ICONV
+#if HAVE_ICONV
 #if defined(_AIX) || defined(__sun)
     const char *from_enc = "UTF-16le";
 #else

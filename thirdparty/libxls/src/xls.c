@@ -40,7 +40,7 @@
 #include <stddef.h>
 #include <errno.h>
 
-#ifdef HAVE_ICONV
+#if HAVE_ICONV
 #include <iconv.h>
 #endif
 
@@ -1628,7 +1628,7 @@ void xls_close_WB(xlsWorkBook* pWB)
 	if(pWB->summary)  free(pWB->summary);
 	if(pWB->docSummary) free(pWB->docSummary);
 
-#ifdef HAVE_ICONV
+#if HAVE_ICONV
     if (pWB->converter)
         iconv_close((iconv_t)pWB->converter);
     if (pWB->utf16_converter)
