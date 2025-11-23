@@ -1681,6 +1681,254 @@ static std::string readDocxText(const std::string &path)
     return parseDocxDocumentXml(xml);
 }
 
+static std::string readZipEntry(const std::string &path, const std::string &entry)
+{
+    ZipArchive archive;
+    if (!archive.open(path)) return {};
+    return archive.fileContent(entry);
+}
+
+static void appendOdfTextNode(const tinyxml2::XMLNode *node, std::string &out)
+{
+    if (!node) return;
+    if (const auto *text = node->ToText())
+    {
+        out += text->Value();
+        return;
+    }
+    const auto *element = node->ToElement();
+    if (!element) return;
+    const char *name = element->Name();
+    if (!name) return;
+    if (std::strcmp(name, "text:line-break") == 0)
+    {
+        out.push_back('\n');
+        return;
+    }
+    if (std::strcmp(name, "text:tab") == 0)
+    {
+        out.push_back('\t');
+        return;
+    }
+    if (std::strcmp(name, "text:s") == 0)
+    {
+        const int count = std::max(1, element->IntAttribute("text:c", 1));
+        out.append(static_cast<size_t>(count), ' ');
+        return;
+    }
+    for (auto child = element->FirstChild(); child; child = child->NextSibling())
+        appendOdfTextNode(child, out);
+}
+
+static std::string odfParagraphText(const tinyxml2::XMLElement *element)
+{
+    if (!element) return {};
+    std::string text;
+    for (auto node = element->FirstChild(); node; node = node->NextSibling())
+        appendOdfTextNode(node, text);
+    return trim(text);
+}
+
+static std::vector<std::vector<std::string>> parseOdfTableElement(const tinyxml2::XMLElement *tableElement)
+{
+    std::vector<std::vector<std::string>> rows;
+    if (!tableElement) return rows;
+    for (auto row = tableElement->FirstChildElement("table:table-row"); row; row = row->NextSiblingElement("table:table-row"))
+    {
+        std::vector<std::string> cells;
+        for (auto cell = row->FirstChildElement(); cell; cell = cell->NextSiblingElement())
+        {
+            const char *cellName = cell->Name();
+            if (!cellName) continue;
+            int repeat = cell->IntAttribute("table:number-columns-repeated", 1);
+            if (repeat < 1) repeat = 1;
+            std::string value;
+            if (std::strcmp(cellName, "table:table-cell") == 0)
+            {
+                std::vector<std::string> fragments;
+                for (auto p = cell->FirstChildElement("text:p"); p; p = p->NextSiblingElement("text:p"))
+                {
+                    const std::string text = odfParagraphText(p);
+                    if (!text.empty()) fragments.push_back(text);
+                }
+                value = join(fragments, "\n");
+            }
+            if (std::strcmp(cellName, "table:table-cell") != 0 && std::strcmp(cellName, "table:covered-table-cell") != 0)
+                continue;
+            for (int i = 0; i < repeat; ++i) cells.push_back(value);
+        }
+        int rowRepeat = row->IntAttribute("table:number-rows-repeated", 1);
+        if (rowRepeat < 1) rowRepeat = 1;
+        if (cells.empty())
+            cells.emplace_back();
+        for (int i = 0; i < rowRepeat; ++i) rows.push_back(cells);
+    }
+    return rows;
+}
+
+static void collectOdtListItems(const tinyxml2::XMLElement *list, std::vector<std::string> &items, const std::string &prefix = "")
+{
+    if (!list) return;
+    for (auto item = list->FirstChildElement("text:list-item"); item; item = item->NextSiblingElement("text:list-item"))
+    {
+        for (auto p = item->FirstChildElement("text:p"); p; p = p->NextSiblingElement("text:p"))
+        {
+            const std::string text = odfParagraphText(p);
+            if (!text.empty()) items.push_back(prefix + "- " + text);
+        }
+        for (auto nested = item->FirstChildElement("text:list"); nested; nested = nested->NextSiblingElement("text:list"))
+            collectOdtListItems(nested, items, prefix + "  ");
+    }
+}
+
+static void collectOdtElements(const tinyxml2::XMLElement *parent, std::vector<std::string> &blocks)
+{
+    for (auto element = parent ? parent->FirstChildElement() : nullptr; element; element = element->NextSiblingElement())
+    {
+        const char *name = element->Name();
+        if (!name) continue;
+        if (std::strcmp(name, "text:p") == 0)
+        {
+            const std::string text = odfParagraphText(element);
+            if (!text.empty()) blocks.push_back(text);
+        }
+        else if (std::strcmp(name, "text:h") == 0)
+        {
+            const std::string text = odfParagraphText(element);
+            if (text.empty()) continue;
+            int level = element->IntAttribute("text:outline-level", 1);
+            level = std::max(1, std::min(6, level));
+            blocks.push_back(std::string(static_cast<size_t>(level), '#') + " " + text);
+        }
+        else if (std::strcmp(name, "text:list") == 0)
+        {
+            std::vector<std::string> listItems;
+            collectOdtListItems(element, listItems);
+            if (!listItems.empty()) blocks.push_back(join(listItems, "\n"));
+        }
+        else if (std::strcmp(name, "table:table") == 0)
+        {
+            std::vector<std::vector<std::string>> rows = parseOdfTableElement(element);
+            if (rows.empty()) continue;
+            size_t maxColumns = 0;
+            for (const auto &row : rows) maxColumns = std::max(maxColumns, row.size());
+            if (maxColumns == 0) continue;
+            for (auto &row : rows)
+                if (row.size() < maxColumns) row.resize(maxColumns);
+            const std::string table = makeMarkdownTable(rows);
+            if (!table.empty()) blocks.push_back(table);
+        }
+        else
+        {
+            collectOdtElements(element, blocks);
+        }
+    }
+}
+
+static std::string parseOdtContentXml(const std::string &xml)
+{
+    tinyxml2::XMLDocument doc;
+    if (doc.Parse(xml.c_str(), xml.size()) != tinyxml2::XML_SUCCESS) return {};
+    const auto *root = doc.RootElement();
+    if (!root) return {};
+    const auto *body = findChildElement(root, "office:body");
+    if (!body) return {};
+    const auto *textBody = findChildElement(body, "office:text");
+    if (!textBody) return {};
+    std::vector<std::string> blocks;
+    collectOdtElements(textBody, blocks);
+    return join(blocks, "\n\n");
+}
+
+static std::string readOdtText(const std::string &path)
+{
+    const std::string xml = readZipEntry(path, "content.xml");
+    if (xml.empty()) return {};
+    return parseOdtContentXml(xml);
+}
+
+static void collectOdpText(const tinyxml2::XMLElement *element, std::vector<std::string> &out)
+{
+    if (!element) return;
+    const char *name = element->Name();
+    if (name && (std::strcmp(name, "text:p") == 0 || std::strcmp(name, "text:h") == 0))
+    {
+        const std::string text = odfParagraphText(element);
+        if (!text.empty()) out.push_back(text);
+    }
+    for (auto child = element->FirstChildElement(); child; child = child->NextSiblingElement())
+        collectOdpText(child, out);
+}
+
+static std::string parseOdpContentXml(const std::string &xml)
+{
+    tinyxml2::XMLDocument doc;
+    if (doc.Parse(xml.c_str(), xml.size()) != tinyxml2::XML_SUCCESS) return {};
+    const auto *root = doc.RootElement();
+    if (!root) return {};
+    const auto *body = findChildElement(root, "office:body");
+    if (!body) return {};
+    const auto *presentation = findChildElement(body, "office:presentation");
+    if (!presentation) return {};
+    std::vector<std::string> slides;
+    int index = 1;
+    for (auto page = presentation->FirstChildElement("draw:page"); page; page = page->NextSiblingElement("draw:page"))
+    {
+        std::vector<std::string> lines;
+        collectOdpText(page, lines);
+        if (lines.empty()) continue;
+        const std::string list = formatMarkdownList(join(lines, "\n"));
+        if (list.empty()) continue;
+        slides.push_back("## Slide " + std::to_string(index++) + "\n\n" + list);
+    }
+    return join(slides, "\n\n");
+}
+
+static std::string readOdpText(const std::string &path)
+{
+    const std::string xml = readZipEntry(path, "content.xml");
+    if (xml.empty()) return {};
+    return parseOdpContentXml(xml);
+}
+
+static std::string parseOdsContentXml(const std::string &xml)
+{
+    tinyxml2::XMLDocument doc;
+    if (doc.Parse(xml.c_str(), xml.size()) != tinyxml2::XML_SUCCESS) return {};
+    const auto *root = doc.RootElement();
+    if (!root) return {};
+    const auto *body = findChildElement(root, "office:body");
+    if (!body) return {};
+    const auto *spreadsheet = findChildElement(body, "office:spreadsheet");
+    if (!spreadsheet) return {};
+    std::vector<std::string> sections;
+    int sheetIndex = 1;
+    for (auto table = spreadsheet->FirstChildElement("table:table"); table; table = table->NextSiblingElement("table:table"))
+    {
+        std::vector<std::vector<std::string>> rows = parseOdfTableElement(table);
+        if (rows.empty()) continue;
+        size_t maxColumns = 0;
+        for (const auto &row : rows) maxColumns = std::max(maxColumns, row.size());
+        if (maxColumns == 0) continue;
+        for (auto &row : rows)
+            if (row.size() < maxColumns) row.resize(maxColumns);
+        const std::string tableMd = makeMarkdownTable(rows);
+        if (tableMd.empty()) continue;
+        std::string title = table->Attribute("table:name") ? table->Attribute("table:name") : "";
+        if (title.empty()) title = "Sheet " + std::to_string(sheetIndex);
+        sections.push_back("## " + title + "\n\n" + tableMd);
+        ++sheetIndex;
+    }
+    return join(sections, "\n\n");
+}
+
+static std::string readOdsText(const std::string &path)
+{
+    const std::string xml = readZipEntry(path, "content.xml");
+    if (xml.empty()) return {};
+    return parseOdsContentXml(xml);
+}
+
 static std::string collectInlineString(const tinyxml2::XMLElement *element)
 {
     std::string text;
@@ -1885,10 +2133,16 @@ ConversionResult convertFile(const std::string &path, const ConversionOptions &o
 
     if (extension == ".docx")
         result.markdown = detail::readDocxText(path);
+    else if (extension == ".odt")
+        result.markdown = detail::readOdtText(path);
     else if (extension == ".pptx")
         result.markdown = detail::readPptxText(path);
+    else if (extension == ".odp")
+        result.markdown = detail::readOdpText(path);
     else if (extension == ".xlsx")
         result.markdown = detail::readXlsxText(path);
+    else if (extension == ".ods")
+        result.markdown = detail::readOdsText(path);
     else if (extension == ".doc" || extension == ".wps")
         result.markdown = detail::readWpsText(path);
     else if (extension == ".et")

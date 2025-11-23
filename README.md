@@ -4,7 +4,7 @@
 
 ## 功能概览
 
-- **广泛的输入格式**：`*.txt *.md *.markdown *.html *.htm *.py *.c *.cpp *.cc *.h *.hpp *.json *.js *.ts *.css *.ini *.cfg *.log *.doc *.docx *.pptx *.xlsx *.wps *.et *.dps` 等主流文档、代码与配置文件。
+- **广泛的输入格式**：`*.txt *.md *.markdown *.html *.htm *.py *.c *.cpp *.cc *.h *.hpp *.json *.js *.ts *.css *.ini *.cfg *.log *.doc *.docx *.odt *.pptx *.odp *.xlsx *.ods *.wps *.et *.dps` 等主流文档、代码与配置文件。
 - **结构化转写**：
   - Word/docx：保留段落、标题、嵌套表格并转换为 Markdown 表格或列表。
   - PPTX/DPS：逐页提取幻灯片标题与项目符号，输出 `## Slide N` 区块。
