@@ -759,6 +759,88 @@ static std::string decodeSimpleRange(const std::string &wordStream, uint32_t fcM
     return utf16ToUtf8(src, span / 2);
 }
 
+static std::vector<std::string> splitTabLine(const std::string &line)
+{
+    std::vector<std::string> cells;
+    std::string current;
+    for (char ch : line)
+    {
+        if (ch == '\t')
+        {
+            cells.push_back(trim(current));
+            current.clear();
+        }
+        else
+        {
+            current.push_back(ch);
+        }
+    }
+    cells.push_back(trim(current));
+    while (!cells.empty() && cells.back().empty()) cells.pop_back();
+    return cells;
+}
+
+static bool isTabularLine(const std::string &line, size_t &columnCount)
+{
+    if (line.find('\t') == std::string::npos) return false;
+    const std::vector<std::string> cells = splitTabLine(line);
+    if (cells.size() < 2) return false;
+    size_t nonEmpty = 0;
+    for (const std::string &cell : cells)
+    {
+        if (!cell.empty()) ++nonEmpty;
+    }
+    if (nonEmpty == 0) return false;
+    columnCount = cells.size();
+    return true;
+}
+
+static std::string convertLinesWithTables(const std::vector<std::string> &lines)
+{
+    if (lines.empty()) return {};
+    std::vector<std::string> blocks;
+    size_t index = 0;
+    while (index < lines.size())
+    {
+        size_t columnCount = 0;
+        if (isTabularLine(lines[index], columnCount))
+        {
+            std::vector<std::vector<std::string>> rows;
+            size_t maxColumns = columnCount;
+            size_t cursor = index;
+            while (cursor < lines.size())
+            {
+                size_t rowColumns = 0;
+                if (!isTabularLine(lines[cursor], rowColumns)) break;
+                std::vector<std::string> cells = splitTabLine(lines[cursor]);
+                if (cells.empty()) break;
+                maxColumns = std::max(maxColumns, cells.size());
+                rows.push_back(std::move(cells));
+                ++cursor;
+            }
+            if (rows.size() >= 2 && maxColumns >= 2)
+            {
+                for (auto &row : rows)
+                    if (row.size() < maxColumns) row.resize(maxColumns);
+                const std::string table = makeMarkdownTable(rows);
+                if (!table.empty()) blocks.push_back(table);
+            }
+            else
+            {
+                blocks.push_back(lines[index]);
+                cursor = index + 1;
+            }
+            index = cursor;
+        }
+        else
+        {
+            blocks.push_back(lines[index]);
+            ++index;
+        }
+    }
+    return join(blocks, "\n\n");
+}
+
 static std::string normalizeWordText(const std::string &raw)
 {
     if (raw.empty()) return {};
@@ -767,19 +849,22 @@ static std::string normalizeWordText(const std::string &raw)
     for (unsigned char byte : raw)
     {
         if (byte == 0x00) continue;
-        if (byte == 0x0D || byte == 0x07 || byte == 0x0B || byte == 0x0C || byte == 0x1E || byte == 0x1F)
+        if (byte == 0x07)
+            cleaned.push_back('\t');
+        else if (byte == 0x0D || byte == 0x0B || byte == 0x0C || byte == 0x1E || byte == 0x1F)
             cleaned.push_back('\n');
         else
             cleaned.push_back(static_cast<char>(byte));
     }
     std::vector<std::string> lines = splitLines(cleaned);
     std::vector<std::string> filtered;
+    filtered.reserve(lines.size());
     for (const std::string &line : lines)
     {
         const std::string trimmedLine = trim(line);
         if (!trimmedLine.empty()) filtered.push_back(trimmedLine);
     }
-    return join(filtered, "\n");
+    return convertLinesWithTables(filtered);
 }
 
 static bool looksLikeDocumentText(const std::string &chunk)
@@ -1269,7 +1354,18 @@ static std::string decodePptTextRecord(uint16_t type, const std::string &payload
     return cleaned;
 }
 
-static void collectPptTextRecords(const std::string &data, int offset, int length, std::vector<std::string> &collected, std::unordered_set<std::string> &seen)
+struct PptTextBucket
+{
+    std::vector<std::string> lines;
+    std::unordered_set<std::string> seen;
+};
+
+static void collectPptTextRecords(const std::string &data,
+                                  int offset,
+                                  int length,
+                                  std::vector<PptTextBucket> &slides,
+                                  PptTextBucket &loose,
+                                  PptTextBucket *currentSlide = nullptr)
 {
     const int end = offset + length;
     int pos = offset;
@@ -1284,9 +1380,18 @@ static void collectPptTextRecords(const std::string &data, int offset, int lengt
         if (bodyEnd > end || bodyEnd > static_cast<int>(data.size())) break;
 
         const uint16_t recVer = static_cast<uint16_t>(verInst & 0x000F);
-        if (recVer == 0x000F && size > 0)
+        const bool treatAsSlideContainer = (size > 0) &&
+                                           ((recVer == 0x000F && (type == 0x03EE || type == 0x03F8 || type == 0x0FF0)) ||
+                                            type == 0x0FF1);
+        if (treatAsSlideContainer)
         {
-            collectPptTextRecords(data, bodyStart, static_cast<int>(size), collected, seen);
+            slides.emplace_back();
+            collectPptTextRecords(data, bodyStart, static_cast<int>(size), slides, loose, &slides.back());
+            if (slides.back().lines.empty()) slides.pop_back();
+        }
+        else if (recVer == 0x000F && size > 0)
+        {
+            collectPptTextRecords(data, bodyStart, static_cast<int>(size), slides, loose, currentSlide);
         }
         else if (size > 0)
         {
@@ -1301,12 +1406,30 @@ static void collectPptTextRecords(const std::string &data, int offset, int lengt
                     if (trimmedLine.empty()) continue;
                     if (trimmedLine.find("\xEF\xBF\xBD") != std::string::npos) continue;
                     if (!looksLikeDocumentText(trimmedLine)) continue;
-                    if (seen.insert(trimmedLine).second) collected.push_back(trimmedLine);
+                    PptTextBucket *target = currentSlide ? currentSlide : &loose;
+                    if (target->seen.insert(trimmedLine).second) target->lines.push_back(trimmedLine);
                 }
             }
         }
         pos = bodyEnd;
     }
+}
+
+static std::string formatDpsSlides(const std::vector<PptTextBucket> &slides)
+{
+    if (slides.empty()) return {};
+    std::vector<std::string> sections;
+    sections.reserve(slides.size());
+    int slideIndex = 1;
+    for (const auto &slide : slides)
+    {
+        if (slide.lines.empty()) continue;
+        const std::string list = formatMarkdownList(join(slide.lines, "\n"));
+        if (list.empty()) continue;
+        sections.push_back("## Slide " + std::to_string(slideIndex++) + "\n\n" + list);
+    }
+    if (sections.empty()) return {};
+    return join(sections, "\n\n");
 }
 
 static std::string readDpsViaPptBinary(const std::string &path)
@@ -1316,11 +1439,13 @@ static std::string readDpsViaPptBinary(const std::string &path)
     const std::string stream = reader.streamByName("PowerPoint Document");
     if (stream.empty()) return {};
 
-    std::vector<std::string> collected;
-    std::unordered_set<std::string> seen;
-    collectPptTextRecords(stream, 0, static_cast<int>(stream.size()), collected, seen);
-    if (collected.empty()) return {};
-    return join(collected, "\n");
+    std::vector<PptTextBucket> slides;
+    PptTextBucket loose;
+    collectPptTextRecords(stream, 0, static_cast<int>(stream.size()), slides, loose, nullptr);
+    const std::string structured = formatDpsSlides(slides);
+    if (!structured.empty()) return structured;
+    if (loose.lines.empty()) return {};
+    return join(loose.lines, "\n");
 }
 
 static std::string readDpsText(const std::string &path)
@@ -1342,6 +1467,7 @@ static std::string readDpsText(const std::string &path)
         if (text.empty()) text = readWpsHeuristic(path);
     }
     if (text.empty()) return {};
+    if (text.rfind("## Slide ", 0) == 0) return text;
     const std::string list = formatMarkdownList(text);
     if (list.empty()) return text;
     return "## DPS Slides\n\n" + list;
