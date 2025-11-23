@@ -1,0 +1,12 @@
+build/
+build-static/
+.vscode/
+CMakeLists.txt.user
+src-old/
+.VSCodeCounter/
+EVA_BACKEND
+参考项目
+测试
+package
+modelcontextprotocol-sdk-1.21.1.tgz
+streamable-http.html
