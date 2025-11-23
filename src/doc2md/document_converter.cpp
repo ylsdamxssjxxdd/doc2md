@@ -776,7 +776,6 @@ static std::vector<std::string> splitTabLine(const std::string &line)
         }
     }
     cells.push_back(trim(current));
-    while (!cells.empty() && cells.back().empty()) cells.pop_back();
     return cells;
 }
 
@@ -795,6 +794,46 @@ static bool isTabularLine(const std::string &line, size_t &columnCount)
     return true;
 }
 
+static std::vector<std::vector<std::string>> expandFlattenedTabRows(const std::vector<std::string> &tokens)
+{
+    if (tokens.size() < 4) return {};
+    size_t bestColumns = 0;
+    double bestScore = 0.0;
+    const size_t maxColumns = std::min<size_t>(32, tokens.size() / 2);
+    for (size_t candidate = 2; candidate <= maxColumns; ++candidate)
+    {
+        if (tokens.size() % candidate != 0) continue;
+        const size_t rows = tokens.size() / candidate;
+        if (rows < 2) continue;
+        double density = 0.0;
+        for (size_t r = 0; r < rows; ++r)
+        {
+            size_t nonEmpty = 0;
+            for (size_t c = 0; c < candidate; ++c)
+            {
+                if (!tokens[r * candidate + c].empty()) ++nonEmpty;
+            }
+            density += static_cast<double>(nonEmpty) / candidate;
+        }
+        density /= rows;
+        if (density > bestScore + 1e-6)
+        {
+            bestScore = density;
+            bestColumns = candidate;
+        }
+    }
+    if (bestColumns == 0) return {};
+    const size_t rows = tokens.size() / bestColumns;
+    std::vector<std::vector<std::string>> expanded(rows);
+    for (size_t r = 0; r < rows; ++r)
+    {
+        auto begin = tokens.begin() + static_cast<std::ptrdiff_t>(r * bestColumns);
+        auto end = begin + static_cast<std::ptrdiff_t>(bestColumns);
+        expanded[r] = std::vector<std::string>(begin, end);
+    }
+    return expanded;
+}
+
 static std::string convertLinesWithTables(const std::vector<std::string> &lines)
 {
     if (lines.empty()) return {};
@@ -806,6 +845,7 @@ static std::string convertLinesWithTables(const std::vector<std::string> &lines)
         if (isTabularLine(lines[index], columnCount))
         {
             std::vector<std::vector<std::string>> rows;
+            std::vector<std::vector<std::string>> rawRowTokens;
             size_t maxColumns = columnCount;
             size_t cursor = index;
             while (cursor < lines.size())
@@ -815,8 +855,19 @@ static std::string convertLinesWithTables(const std::vector<std::string> &lines)
                 std::vector<std::string> cells = splitTabLine(lines[cursor]);
                 if (cells.empty()) break;
                 maxColumns = std::max(maxColumns, cells.size());
+                rawRowTokens.push_back(cells);
                 rows.push_back(std::move(cells));
                 ++cursor;
+            }
+            if (rows.size() < 2 && rows.size() == 1)
+            {
+                const std::vector<std::vector<std::string>> expanded = expandFlattenedTabRows(rawRowTokens.front());
+                if (!expanded.empty())
+                {
+                    rows = expanded;
+                    maxColumns = 0;
+                    for (const auto &row : rows) maxColumns = std::max(maxColumns, row.size());
+                }
             }
             if (rows.size() >= 2 && maxColumns >= 2)
             {
@@ -846,12 +897,33 @@ static std::string normalizeWordText(const std::string &raw)
     if (raw.empty()) return {};
     std::string cleaned;
     cleaned.reserve(raw.size());
-    for (unsigned char byte : raw)
+    for (size_t i = 0; i < raw.size(); ++i)
     {
+        unsigned char byte = static_cast<unsigned char>(raw[i]);
         if (byte == 0x00) continue;
         if (byte == 0x07)
-            cleaned.push_back('\t');
-        else if (byte == 0x0D || byte == 0x0B || byte == 0x0C || byte == 0x1E || byte == 0x1F)
+        {
+            size_t runLength = 0;
+            while (i < raw.size() && static_cast<unsigned char>(raw[i]) == 0x07)
+            {
+                ++runLength;
+                ++i;
+            }
+            if (runLength == 0) continue;
+            if (runLength == 1)
+            {
+                cleaned.push_back('\t');
+            }
+            else
+            {
+                for (size_t j = 0; j + 1 < runLength; ++j)
+                    cleaned.push_back('\t');
+                cleaned.push_back('\n');
+            }
+            --i;
+            continue;
+        }
+        if (byte == 0x0D || byte == 0x0B || byte == 0x0C || byte == 0x1E || byte == 0x1F)
             cleaned.push_back('\n');
         else
             cleaned.push_back(static_cast<char>(byte));
