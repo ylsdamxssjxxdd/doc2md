@@ -4,6 +4,9 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: write
+
 jobs:
   linux-x86_64:
     runs-on: ubuntu-22.04
