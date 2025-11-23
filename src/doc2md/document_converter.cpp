@@ -794,6 +794,44 @@ static bool looksLikeDocumentText(const std::string &chunk)
     return true;
 }
 
+static bool isLikelyPrintableWordChar(uint16_t ch)
+{
+    if (ch == 0x0000 || ch == 0xFFFF || ch == 0xFFFE) return false;
+    if (ch == 0x0009 || ch == 0x000A || ch == 0x000D) return true;
+    if (ch == 0x3000) return true;
+    if (ch >= 0x20 && ch <= 0xD7FF) return true;
+    if (ch >= 0xE000 && ch <= 0xF8FF) return false;
+    if (ch >= 0xF000) return false;
+    return false;
+}
+
+static bool isValidUtf8(const std::string &text)
+{
+    int expected = 0;
+    for (unsigned char byte : text)
+    {
+        if (expected == 0)
+        {
+            if ((byte & 0x80) == 0)
+                continue;
+            else if ((byte & 0xE0) == 0xC0)
+                expected = 1;
+            else if ((byte & 0xF0) == 0xE0)
+                expected = 2;
+            else if ((byte & 0xF8) == 0xF0)
+                expected = 3;
+            else
+                return false;
+        }
+        else
+        {
+            if ((byte & 0xC0) != 0x80) return false;
+            --expected;
+        }
+    }
+    return expected == 0;
+}
+
 static int chunkScore(const std::string &chunk)
 {
     int cjk = 0;
@@ -1139,21 +1177,170 @@ static std::string readEtText(const std::string &path)
     return "## ET Workbook\n\n" + text;
 }
 
+static bool isPptTextRecordType(uint16_t type)
+{
+    switch (type)
+    {
+    case 0x0FA0: // TextCharsAtom
+    case 0x0FA8: // TextBytesAtom
+    case 0x0FBA: // CString
+    case 0x0D45: // SlideNameAtom
+        return true;
+    default:
+        break;
+    }
+    return false;
+}
+
+static bool looksUtf16TextPayload(const std::string &payload)
+{
+    if (payload.size() < 4 || (payload.size() & 1)) return false;
+    const size_t charCount = payload.size() / 2;
+    if (charCount == 0) return false;
+    size_t printable = 0;
+    for (size_t i = 0; i + 1 < payload.size(); i += 2)
+    {
+        const uint16_t value = readLe<uint16_t>(reinterpret_cast<const uint8_t *>(payload.data() + i));
+        if (value == 0x0000) continue;
+        if (value == 0x0009 || value == 0x000A || value == 0x000D)
+        {
+            ++printable;
+            continue;
+        }
+        if (isLikelyPrintableWordChar(value)) ++printable;
+    }
+    return printable * 2 >= charCount;
+}
+
+static bool looksLatinTextPayload(const std::string &payload)
+{
+    if (payload.size() < 3) return false;
+    size_t printable = 0;
+    for (unsigned char ch : payload)
+    {
+        if ((ch >= 32 && ch <= 126) || ch == '\r' || ch == '\n' || ch == '\t')
+            ++printable;
+    }
+    return printable * 2 >= payload.size();
+}
+
+static std::string decodePptBytes(const std::string &payload)
+{
+    if (isValidUtf8(payload)) return payload;
+    static const uint32_t codePages[] = {936, 950, 932, 1252};
+    for (uint32_t cp : codePages)
+    {
+        const std::string decoded = convertBufferWithCodePage(payload, cp);
+        if (!decoded.empty()) return decoded;
+    }
+    return latin1ToUtf8(payload);
+}
+
+static std::string decodePptTextRecord(uint16_t type, const std::string &payload)
+{
+    if (!isPptTextRecordType(type) || payload.empty()) return {};
+    std::string decoded;
+    if (looksUtf16TextPayload(payload))
+    {
+        const char16_t *chars = reinterpret_cast<const char16_t *>(payload.data());
+        decoded = utf16ToUtf8(chars, payload.size() / 2);
+    }
+    else if (looksLatinTextPayload(payload))
+    {
+        decoded = decodePptBytes(payload);
+    }
+    else
+    {
+        return {};
+    }
+
+    std::string cleaned;
+    cleaned.reserve(decoded.size());
+    for (unsigned char byte : decoded)
+    {
+        if (byte == 0x00) continue;
+        if (byte == 0x0D || byte == 0x0B)
+            cleaned.push_back('\n');
+        else if (byte == 0x09)
+            cleaned.push_back(' ');
+        else if (byte >= 0x20 || static_cast<int8_t>(byte) < 0)
+            cleaned.push_back(static_cast<char>(byte));
+    }
+    return cleaned;
+}
+
+static void collectPptTextRecords(const std::string &data, int offset, int length, std::vector<std::string> &collected, std::unordered_set<std::string> &seen)
+{
+    const int end = offset + length;
+    int pos = offset;
+    while (pos + 8 <= end)
+    {
+        const uint8_t *ptr = reinterpret_cast<const uint8_t *>(data.data() + pos);
+        const uint16_t verInst = readLe<uint16_t>(ptr);
+        const uint16_t type = readLe<uint16_t>(ptr + 2);
+        const uint32_t size = readLe<uint32_t>(ptr + 4);
+        const int bodyStart = pos + 8;
+        const int bodyEnd = bodyStart + static_cast<int>(size);
+        if (bodyEnd > end || bodyEnd > static_cast<int>(data.size())) break;
+
+        const uint16_t recVer = static_cast<uint16_t>(verInst & 0x000F);
+        if (recVer == 0x000F && size > 0)
+        {
+            collectPptTextRecords(data, bodyStart, static_cast<int>(size), collected, seen);
+        }
+        else if (size > 0)
+        {
+            const std::string payload(data.data() + bodyStart, static_cast<size_t>(size));
+            const std::string decoded = decodePptTextRecord(type, payload);
+            if (!decoded.empty())
+            {
+                const std::vector<std::string> lines = splitLines(decoded);
+                for (const std::string &line : lines)
+                {
+                    const std::string trimmedLine = trim(line);
+                    if (trimmedLine.empty()) continue;
+                    if (trimmedLine.find("\xEF\xBF\xBD") != std::string::npos) continue;
+                    if (!looksLikeDocumentText(trimmedLine)) continue;
+                    if (seen.insert(trimmedLine).second) collected.push_back(trimmedLine);
+                }
+            }
+        }
+        pos = bodyEnd;
+    }
+}
+
+static std::string readDpsViaPptBinary(const std::string &path)
+{
+    CompoundFileReader reader;
+    if (!reader.load(path)) return {};
+    const std::string stream = reader.streamByName("PowerPoint Document");
+    if (stream.empty()) return {};
+
+    std::vector<std::string> collected;
+    std::unordered_set<std::string> seen;
+    collectPptTextRecords(stream, 0, static_cast<int>(stream.size()), collected, seen);
+    if (collected.empty()) return {};
+    return join(collected, "\n");
+}
+
 static std::string readDpsText(const std::string &path)
 {
-    std::string text;
-    CompoundFileReader reader;
-    if (reader.load(path))
+    std::string text = readDpsViaPptBinary(path);
+    if (text.empty())
     {
-        const std::string stream = reader.streamByName("PowerPoint Document");
-        if (!stream.empty())
+        CompoundFileReader reader;
+        if (reader.load(path))
         {
-            text = extractUtf16Text(stream);
-            if (text.empty())
-                text = decodeWithCodecNames(stream, {"GB18030", "Big5", "Shift-JIS", "Windows-1252"});
+            const std::string stream = reader.streamByName("PowerPoint Document");
+            if (!stream.empty())
+            {
+                text = extractUtf16Text(stream);
+                if (text.empty())
+                    text = decodeWithCodecNames(stream, {"GB18030", "Big5", "Shift-JIS", "Windows-1252"});
+            }
         }
+        if (text.empty()) text = readWpsHeuristic(path);
     }
-    if (text.empty()) text = readWpsHeuristic(path);
     if (text.empty()) return {};
     const std::string list = formatMarkdownList(text);
     if (list.empty()) return text;
