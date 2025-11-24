@@ -1,8 +1,10 @@
-name: Release Builds
+name: Nightly Builds
 
 on:
-  release:
-    types: [published]
+  push:
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -129,12 +131,21 @@ jobs:
 
       - name: Collect files
         run: |
-          mkdir uploads
-          find release -type f -maxdepth 2 -print -exec cp {} uploads/ \;
+          rm -rf uploads
+          mkdir -p uploads
+          find release -type f -print0 | while IFS= read -r -d '' file; do
+            base=$(basename "$file")
+            cp "$file" "uploads/$base"
+          done
 
-      - name: Attach assets to release
-        uses: softprops/action-gh-release@v1
+      - name: Publish nightly release
+        uses: ncipollo/release-action@v1
         with:
-          files: uploads/*
+          tag: nightly
+          releaseName: Nightly
+          allowUpdates: true
+          removeArtifacts: true
+          makeLatest: true
+          artifacts: uploads/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
